@@ -23,7 +23,10 @@ TOKEN = os.getenv("BOT_TOKEN")
 if not TOKEN:
     raise ValueError("BOT_TOKEN topilmadi. .env faylida BOT_TOKEN=... ni yozing.")
 
-DB_FILE = "looptrecker.db"
+DATA_DIR = Path("/data")
+DB_FILE = str(DATA_DIR / "looptrecker.db") if DATA_DIR.exists() else str(
+    Path(__file__).with_name("looptrecker.db")
+)
 
 # -----------------------------
 # Logging
@@ -231,7 +234,8 @@ def get_stats(user_id: int) -> str:
 # Telegram handlers
 # -----------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
+    user = update.effective_user 
+    schedule_reminder(context.application.job_queue, user.id)
     text = (
         "Salom! Men Looptrecker, habit tracker botman.\n\n"
         "Mavjud buyruqlar:\n"
@@ -298,32 +302,71 @@ async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Noma'lum buyruq. /help buyrug'ini ishlating."
     )
 
+def get_user_ids():
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT DISTINCT user_id FROM habits"
+    ).fetchall()
+    conn.close()
+    return [row["user_id"] for row in rows]
+
+
+def schedule_reminder(job_queue, user_id):
+    job_name = f"daily_reminder_{user_id}"
+
+    for job in job_queue.get_jobs_by_name(job_name):
+        job.schedule_removal()
+
+    job_queue.run_daily(
+        daily_reminder,
+        time=datetime.strptime("21:00", "%H:%M").time(),
+        user_id=user_id,
+        name=job_name,
+    )
+
+
+async def post_init(application):
+    for user_id in get_user_ids():
+        schedule_reminder(application.job_queue, user_id)
+
+
 async def daily_reminder(context: ContextTypes.DEFAULT_TYPE):
-    # Har kuni soat 21:00 da eslatma yuboradi.
     user_id = context.job.user_id
     habits = list_habits(user_id)
+
     if not habits:
         return
+
     names = ", ".join(h["name"] for h in habits)
+
     await context.bot.send_message(
         chat_id=user_id,
-        text=f"Hi! Bugun qaysi odatlarni bajardingiz?\n"
-             f"Odatlaringiz: {names}\n\n"
-             f"Yodda tuting: /done <odat_nomi>"
+        text=(
+            f"Salom! Bugun qaysi odatlarni bajardingiz?\n"
+            f"Odatlaringiz: {names}\n\n"
+            f"Yodda tuting: /done <odat_nomi>"
+        )
     )
+
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.exception("Botda xatolik yuz berdi: %s", context.error)
-    if isinstance(update, Update) and update.effective_message:
-        await update.effective_message.reply_text("Kechirasiz, botda xatolik yuz berdi. Iltimos, keyinroq urinib ko'ring.")
 
+    if isinstance(update, Update) and update.effective_message:
+        await update.effective_message.reply_text(
+            "Kechirasiz, botda xatolik yuz berdi. Iltimos, keyinroq urinib ko'ring."
+        )
 # -----------------------------
 # Main
-# -----------------------------
 def main():
     init_db()
 
-    app = Application.builder().token(TOKEN).build()
+    app = (
+        Application.builder()
+        .token(TOKEN)
+        .post_init(post_init)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("add", add_command))
@@ -333,26 +376,18 @@ def main():
     app.add_handler(CommandHandler("remove", remove_command))
     app.add_handler(CommandHandler("help", help_command))
 
-    # Noma'lum buyruqlar
-    app.add_handler(MessageHandler(filters.COMMAND & ~filters.Regex(r"^/(start|add|done|list|stats|remove|help)$"), unknown_command))
+    app.add_handler(MessageHandler(
+        filters.COMMAND & ~filters.Regex(
+            r"^/(start|add|done|list|stats|remove|help)$"
+        ),
+        unknown_command
+    ))
 
-    # Xatoliklarni ushlab turish
     app.add_error_handler(error_handler)
-
-    # Har kuni 21:00 da eslatma
-    # job queue orqali uxlab qolmaydi, polling ichida ishlaydi
-    # Har bir foydalanuvchiga alohida job qo'shamiz
-    # (Botni ishga tushirishdan keyin /start ni bosing)
-    app.job_queue.run_daily(
-        daily_reminder,
-        time=datetime.strptime("21:00", "%H:%M").time(),
-    )
-
-    # Agar xohlasangiz, buni funksiya ichida user bazasi bo'yicha job qo'shishingiz mumkin.
-    # Quyidagi variant oddiy va ishlaydi: polling.
 
     logger.info("Looptrecker bot ishga tushdi.")
     app.run_polling(drop_pending_updates=True)
+
 
 if __name__ == "__main__":
     main()
